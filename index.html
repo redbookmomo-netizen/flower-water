@@ -43,8 +43,10 @@
   .pill[aria-pressed="false"] { opacity: .55; }
   #rainBtn { left: 12px; top: 12px; }
   #shineBtn { right: 12px; top: 12px; }
+  #musicBtn { left: 12px; bottom: 12px; }
+  #sfxBtn { right: 12px; bottom: 12px; }
   .hint {
-    position: absolute; left: 0; right: 0; bottom: 18px; z-index: 3;
+    position: absolute; left: 0; right: 0; bottom: 56px; z-index: 3; margin: 0; line-height: 1.9;
     text-align: center; font-size: 13px; letter-spacing: .2em;
     color: rgba(255,255,255,.95); text-shadow: 0 1px 8px rgba(40,70,120,.55);
     pointer-events: none; transition: opacity 1.4s;
@@ -58,8 +60,248 @@
     <canvas id="water" aria-label="可以点和划的水面花瓣图"></canvas>
     <button class="pill" id="rainBtn" type="button" aria-pressed="true">细雨 · 开</button>
     <button class="pill" id="shineBtn" type="button" aria-pressed="true">波光 · 开</button>
-    <p class="hint" id="hint">点一下水面 · 用手指划过去</p>
+    <button class="pill" id="musicBtn" type="button" aria-pressed="true">♪ 音乐 · 开</button>
+    <button class="pill" id="sfxBtn" type="button" aria-pressed="true">音效 · 开</button>
+    <p class="hint" id="hint">点一下水面 · 用手指划过去<br>第一次触碰后音乐会慢慢响起</p>
   </div>
+
+<script>
+/* ===================== 声音：全部由 Web Audio 实时合成，不用任何音频文件 =====================
+ * 触碰：一声“叮咚”水滴 + 一个柔和的钢琴音，音高跟着手指的高低走（越往上越高），都在 D 大调五声音阶里，
+ *       所以不管怎么点、怎么划，都和背景音乐是和谐的，像在水面上弹琴
+ * 划动：沿路洒下一串很轻的小水音
+ * 细雨：落雨时有极轻的水滴声
+ * BGM：萨蒂《吉诺佩蒂》那种 3/4 拍、Gmaj7 ↔ Dmaj7 摇摆的氛围，旋律每次随机即兴（不是原曲）
+ */
+window.WaterSound = (function () {
+  let ctx = null, master, comp, reverb, wet, bgmBus, sfxBus;
+  let started = false, musicOn = true, sfxOn = true;
+  const BGM_LEVEL = 0.55;
+  const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+
+  // D 大调五声音阶 D E F# A B，从 D4 到 D6
+  const PENTA = [62, 64, 66, 69, 71, 74, 76, 78, 81, 83, 86];
+
+  function makeIR(c, seconds, decay) {
+    const rate = c.sampleRate, len = Math.floor(rate * seconds);
+    const buf = c.createBuffer(2, len, rate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = buf.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        const t = i / len;
+        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - t, decay) * Math.min(1, i / (rate * 0.012));
+      }
+    }
+    return buf;
+  }
+
+  function graph(c) {
+    ctx = c;
+    comp = c.createDynamicsCompressor();
+    comp.threshold.value = -16; comp.knee.value = 12; comp.ratio.value = 4;
+    comp.attack.value = 0.004; comp.release.value = 0.3;
+    master = c.createGain(); master.gain.value = 1.15;
+    master.connect(comp); comp.connect(c.destination);
+    reverb = c.createConvolver(); reverb.buffer = makeIR(c, 3.6, 2.4);
+    wet = c.createGain(); wet.gain.value = 0.45;
+    reverb.connect(wet); wet.connect(master);
+    bgmBus = c.createGain(); bgmBus.gain.value = 0;
+    sfxBus = c.createGain(); sfxBus.gain.value = 0.6;
+    [bgmBus, sfxBus].forEach(b => { b.connect(master); b.connect(reverb); });
+  }
+
+  // 柔和的“毛毡钢琴”音色：几条泛音叠在一起，高泛音衰减更快，再过一个慢慢合上的低通
+  function piano(t, midi, vel, dest, dur) {
+    const f = mtof(midi);
+    const out = ctx.createGain();
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.Q.value = 0.2;
+    lp.frequency.setValueAtTime(Math.min(8000, f * 5 + 600), t);
+    lp.frequency.exponentialRampToValueAtTime(Math.max(260, f * 1.6), t + dur);
+    out.connect(lp); lp.connect(dest);
+    const parts = [[1, 1], [2, 0.38], [3, 0.16], [4, 0.07], [5, 0.035]];
+    for (const [k, a] of parts) {
+      const o = ctx.createOscillator();
+      o.type = 'sine';
+      o.frequency.value = f * k * (1 + 0.00035 * k * k);
+      const g = ctx.createGain();
+      const d = dur / (1 + (k - 1) * 0.55);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.linearRampToValueAtTime(a * vel, t + 0.008);
+      g.gain.exponentialRampToValueAtTime(a * vel * 0.32, t + 0.3);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+      o.connect(g); g.connect(out);
+      o.start(t); o.stop(t + d + 0.05);
+    }
+  }
+
+  // 水滴“啵”：正弦波音高快速上扬 + 很快消失
+  function droplet(t, vel, hz) {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(hz, t);
+    o.frequency.exponentialRampToValueAtTime(hz * 2.7, t + 0.055);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(vel, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+    o.connect(g); g.connect(sfxBus);
+    o.start(t); o.stop(t + 0.14);
+  }
+
+  function pitchAt(y01) {
+    const idx = Math.round((1 - Math.max(0, Math.min(1, y01))) * (PENTA.length - 1));
+    return PENTA[idx];
+  }
+
+  function tapAt(t, x01, y01, strength) {
+    const m = pitchAt(y01);
+    droplet(t, 0.30 * strength, 420 + Math.random() * 260);
+    piano(t + 0.012, m, 0.30 * strength, sfxBus, 3.2);
+    // 一点点高八度的“晶莹感”
+    piano(t + 0.02, m + 12, 0.06 * strength, sfxBus, 1.6);
+  }
+
+  // ---------------- BGM：生成式萨蒂风 ----------------
+  const BAR = 2.7, BEAT = BAR / 3;
+  const CHORDS = [
+    { b: 43, c: [59, 62, 66], tones: [67, 71, 74, 78, 79] }, // Gmaj7
+    { b: 38, c: [57, 61, 66], tones: [66, 69, 73, 74, 78] }, // Dmaj7
+    { b: 43, c: [59, 62, 66], tones: [67, 71, 74, 78, 79] },
+    { b: 38, c: [57, 61, 66], tones: [66, 69, 73, 74, 78] },
+    { b: 40, c: [55, 59, 62], tones: [67, 71, 74, 76, 79] }, // Em7
+    { b: 38, c: [57, 61, 66], tones: [66, 69, 73, 74, 78] },
+    { b: 43, c: [59, 62, 66], tones: [67, 71, 74, 78, 79] },
+    { b: 45, c: [57, 61, 64], tones: [69, 73, 76, 79, 81] }, // A
+  ];
+  const SCALE = [64, 66, 67, 69, 71, 73, 74, 76, 78, 79, 81]; // D 大调，E4~A5
+  let bar = 0, mel = 6, nextBar = 0, timer = null;
+
+  const nearestTone = (tones, cur) => tones.reduce((best, n) => Math.abs(n - cur) < Math.abs(best - cur) ? n : best, tones[0]);
+  const hum = () => (Math.random() - 0.5) * 0.03;
+
+  function scheduleBar(t) {
+    const ch = CHORDS[bar % CHORDS.length];
+    // 第 1 拍低音，第 2 拍和弦（就是《吉诺佩蒂》那种一摇一晃）
+    piano(t + hum(), ch.b, 0.22, bgmBus, 6);
+    ch.c.forEach((n, i) => piano(t + BEAT + i * 0.012 + hum(), n, 0.085, bgmBus, 5));
+
+    // 旋律：8 小节一句，前 6 小节唱、后 2 小节留白呼吸
+    const phrasePos = bar % 8;
+    if (bar >= 4 && phrasePos < 6 && Math.random() < 0.92) {
+      const cur = SCALE[mel];
+      const target = nearestTone(ch.tones, cur + (Math.random() < 0.5 ? -2 : 2));
+      mel = SCALE.indexOf(target) >= 0 ? SCALE.indexOf(target) : mel;
+      const r = Math.random();
+      if (r < 0.45) {
+        piano(t + hum(), SCALE[mel], 0.17, bgmBus, 6);                 // 一个附点二分音符
+      } else if (r < 0.85) {
+        piano(t + hum(), SCALE[mel], 0.17, bgmBus, 5);                 // 二分 + 四分
+        const step = Math.random() < 0.5 ? -1 : 1;
+        mel = Math.max(0, Math.min(SCALE.length - 1, mel + step));
+        piano(t + 2 * BEAT + hum(), SCALE[mel], 0.13, bgmBus, 4);
+      } else {
+        for (let k = 0; k < 3; k++) {                                  // 三个四分音符缓缓走下来
+          piano(t + k * BEAT + hum(), SCALE[mel], 0.14 - k * 0.015, bgmBus, 4);
+          mel = Math.max(0, mel - 1);
+        }
+      }
+    }
+    // 偶尔一颗很高很轻的星星音
+    if (Math.random() < 0.18) piano(t + BEAT * (1 + Math.floor(Math.random() * 2)) + 0.3, PENTA[7 + Math.floor(Math.random() * 4)] + 12, 0.035, bgmBus, 2.5);
+    bar++;
+  }
+
+  function pump() {
+    if (!ctx || !musicOn || ctx.state !== 'running') return;
+    if (nextBar < ctx.currentTime) nextBar = ctx.currentTime + 0.15;
+    while (nextBar < ctx.currentTime + 1.2) { scheduleBar(nextBar); nextBar += BAR; }
+  }
+
+  function start() {
+    if (started) return;
+    started = true;
+    nextBar = ctx.currentTime + 0.4;
+    if (musicOn) {
+      bgmBus.gain.setValueAtTime(0.0001, ctx.currentTime);
+      bgmBus.gain.exponentialRampToValueAtTime(BGM_LEVEL, ctx.currentTime + 5);
+    }
+    timer = setInterval(pump, 250);
+    pump();
+  }
+
+  // 必须在用户手势里调用（iOS / Chrome 的自动播放规则）
+  function unlock() {
+    if (!ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { /* 旧版 Safari */ }
+      graph(new AC({ latencyHint: 'interactive' }));
+      ctx.onstatechange = () => { if (ctx.state === 'running') start(); };
+    }
+    if (ctx.state !== 'running') {
+      ctx.resume().catch(() => {});
+      try { const s = ctx.createBufferSource(); s.buffer = ctx.createBuffer(1, 1, 22050); s.connect(ctx.destination); s.start(0); } catch (e) { /* 忽略 */ }
+    } else start();
+  }
+
+  function whenRunning(fn) {
+    if (!ctx) return;
+    if (ctx.state === 'running') fn(ctx.currentTime);
+    else ctx.resume().then(() => fn(ctx.currentTime)).catch(() => {});
+  }
+
+  let lastDrag = 0;
+  document.addEventListener('visibilitychange', () => {
+    if (!ctx) return;
+    if (document.hidden) ctx.suspend().catch(() => {});
+    else if (started) ctx.resume().then(() => { nextBar = ctx.currentTime + 0.2; }).catch(() => {});
+  });
+
+  return {
+    unlock,
+    tap(x01, y01) { if (sfxOn) whenRunning(t => tapAt(t, x01, y01, 1)); },
+    drag(x01, y01) {
+      if (!sfxOn || !ctx || ctx.state !== 'running') return;
+      const now = performance.now();
+      if (now - lastDrag < 95) return;
+      lastDrag = now;
+      const t = ctx.currentTime, m = pitchAt(y01);
+      droplet(t, 0.07, 500 + Math.random() * 300);
+      piano(t + 0.01, m, 0.075, sfxBus, 1.8);
+    },
+    rain() {
+      if (!sfxOn || !ctx || ctx.state !== 'running') return;
+      const t = ctx.currentTime;
+      droplet(t, 0.045, 650 + Math.random() * 500);
+    },
+    setMusic(on) {
+      musicOn = on;
+      if (!ctx) return;
+      const t = ctx.currentTime;
+      bgmBus.gain.cancelScheduledValues(t);
+      bgmBus.gain.setValueAtTime(Math.max(0.0001, bgmBus.gain.value), t);
+      bgmBus.gain.exponentialRampToValueAtTime(on ? BGM_LEVEL : 0.0001, t + (on ? 2.5 : 1.2));
+      if (on) { nextBar = t + 0.2; pump(); }
+    },
+    setSfx(on) { sfxOn = on; },
+    // 仅供测试：离线渲染几小节，检查有没有声音、会不会爆音
+    async renderTest(sec) {
+      const off = new OfflineAudioContext(2, 44100 * sec, 44100);
+      graph(off);
+      bgmBus.gain.value = BGM_LEVEL;
+      let t = 0.1;
+      while (t < sec - 3) { scheduleBar(t); t += BAR; }
+      tapAt(1.0, 0.5, 0.2, 1); tapAt(2.2, 0.5, 0.8, 1);
+      for (let k = 0; k < 10; k++) { droplet(3 + k * 0.1, 0.07, 600); piano(3.01 + k * 0.1, pitchAt(k / 10), 0.075, sfxBus, 1.8); }
+      const buf = await off.startRendering();
+      let peak = 0, sum = 0; const d = buf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a; sum += d[i] * d[i]; }
+      ctx = null;
+      return { peak: +peak.toFixed(3), rms: +Math.sqrt(sum / d.length).toFixed(4), seconds: sec };
+    },
+  };
+})();
+</script>
 
 <script>
 (function () {
@@ -292,11 +534,14 @@
   }
   function firstTouch() { if (!touched) { touched = true; hint.classList.add('gone'); } }
 
+  const S = window.WaterSound;
   canvas.addEventListener('pointerdown', e => {
     canvas.setPointerCapture(e.pointerId);
     const p = local(e);
     last.set(e.pointerId, p);
     drop(p.x, p.y, e.pointerType === 'touch' ? 20 : 16, -1.8);
+    S.unlock();
+    S.tap(p.x / W, p.y / H);
     firstTouch();
   });
   canvas.addEventListener('pointermove', e => {
@@ -304,21 +549,25 @@
     const l = last.get(e.pointerId);
     const pressed = e.buttons !== 0 || e.pointerType === 'touch';
     if (l) {
-      if (pressed) trail(l, p, 12, -0.34);        // 手指划过水面
-      else if (e.pointerType === 'mouse') trail(l, p, 9, -0.08); // 鼠标轻轻掠过
+      if (pressed) { trail(l, p, 12, -0.34); S.drag(p.x / W, p.y / H); }   // 手指划过水面
+      else if (e.pointerType === 'mouse') trail(l, p, 9, -0.08);         // 鼠标轻轻掠过（不出声）
     }
     last.set(e.pointerId, p);
   });
-  const forget = e => { if (e.pointerType !== 'mouse') last.delete(e.pointerId); };
+  const forget = e => { S.unlock(); if (e.pointerType !== 'mouse') last.delete(e.pointerId); };
   canvas.addEventListener('pointerup', forget);
-  canvas.addEventListener('pointercancel', forget);
+  canvas.addEventListener('pointercancel', e => { if (e.pointerType !== 'mouse') last.delete(e.pointerId); });
   canvas.addEventListener('pointerleave', e => last.delete(e.pointerId));
+  document.addEventListener('touchend', () => S.unlock(), { passive: true }); // iOS 只认 touchend 为“用户手势”
 
   // ---------------- 开关 ----------------
-  let rain = true, shine = true, shineMix = 1;
+  let rain = true, shine = true, shineMix = 1, music = true, sfx = true;
   const rainBtn = document.getElementById('rainBtn'), shineBtn = document.getElementById('shineBtn');
-  rainBtn.onclick = () => { rain = !rain; rainBtn.setAttribute('aria-pressed', rain); rainBtn.textContent = rain ? '细雨 · 开' : '细雨 · 关'; };
-  shineBtn.onclick = () => { shine = !shine; shineBtn.setAttribute('aria-pressed', shine); shineBtn.textContent = shine ? '波光 · 开' : '波光 · 关'; };
+  const musicBtn = document.getElementById('musicBtn'), sfxBtn = document.getElementById('sfxBtn');
+  rainBtn.onclick = () => { rain = !rain; rainBtn.setAttribute('aria-pressed', rain); rainBtn.textContent = rain ? '细雨 · 开' : '细雨 · 关'; S.unlock(); };
+  shineBtn.onclick = () => { shine = !shine; shineBtn.setAttribute('aria-pressed', shine); shineBtn.textContent = shine ? '波光 · 开' : '波光 · 关'; S.unlock(); };
+  musicBtn.onclick = () => { music = !music; musicBtn.setAttribute('aria-pressed', music); musicBtn.textContent = music ? '♪ 音乐 · 开' : '♪ 音乐 · 关'; S.setMusic(music); S.unlock(); };
+  sfxBtn.onclick = () => { sfx = !sfx; sfxBtn.setAttribute('aria-pressed', sfx); sfxBtn.textContent = sfx ? '音效 · 开' : '音效 · 关'; S.setSfx(sfx); S.unlock(); };
 
   // 偶尔落下一滴很轻的雨，让水面一直活着
   let nextRain = performance.now() + 1800;
@@ -326,6 +575,7 @@
     if (!rain || now < nextRain) return;
     nextRain = now + 1600 + Math.random() * 3200;
     drop(Math.random() * W, Math.random() * H, 7 + Math.random() * 9, -(0.45 + Math.random() * 0.6));
+    S.rain();
   }
 
   // ---------------- 主循环 ----------------
